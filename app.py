@@ -53,18 +53,19 @@ if 'run_analysis' not in st.session_state:
 
 def validate_transaction_data(df):
     """
-    Validate uploaded transaction data
+    Validate uploaded transaction data with improved column detection
     
     Returns:
     --------
     tuple: (is_valid, error_message, cleaned_df)
     """
-    required_columns = ['InvoiceNo', 'Description']
+    # Strip whitespace from column names
+    df.columns = df.columns.str.strip()
     
-    # Check if required columns exist (case-insensitive)
-    df_columns_lower = [col.lower() for col in df.columns]
+    # Display detected columns for debugging
+    st.sidebar.write("**Detected Columns:**", list(df.columns))
     
-    # Try to find required columns
+    # Try to find required columns (case-insensitive, flexible matching)
     invoice_col = None
     description_col = None
     quantity_col = None
@@ -72,31 +73,65 @@ def validate_transaction_data(df):
     
     for col in df.columns:
         col_lower = col.lower()
-        if 'invoice' in col_lower or 'transaction' in col_lower or 'order' in col_lower:
+        
+        # Invoice/Transaction ID detection (IMPROVED)
+        if any(keyword in col_lower for keyword in ['invoice', 'transaction', 'order', 'receipt', 'bill', 'member']):
             invoice_col = col
-        elif 'description' in col_lower or 'item' in col_lower or 'product' in col_lower:
+        
+        # Description/Product/Item detection (IMPROVED)
+        elif any(keyword in col_lower for keyword in ['description', 'item', 'product', 'name', 'stockcode', 'sku']):
             description_col = col
-        elif 'quantity' in col_lower or 'qty' in col_lower or 'amount' in col_lower:
+        
+        # Quantity detection
+        elif any(keyword in col_lower for keyword in ['quantity', 'qty', 'amount', 'count']):
             quantity_col = col
-        elif 'country' in col_lower or 'region' in col_lower or 'location' in col_lower:
+        
+        # Country/Location detection
+        elif any(keyword in col_lower for keyword in ['country', 'region', 'location', 'nation']):
             country_col = col
     
-    # Check if we found required columns
+    # If still not found, try alternative approach: use first 2 columns
+    if invoice_col is None and len(df.columns) >= 1:
+        st.sidebar.warning("⚠️ Invoice column not detected by keywords. Using first column.")
+        invoice_col = df.columns[0]
+    
+    if description_col is None and len(df.columns) >= 2:
+        st.sidebar.warning("⚠️ Description column not detected by keywords. Using second or third column.")
+        # Try to find the most likely description column
+        for col in df.columns[1:]:
+            if col != invoice_col and df[col].dtype == 'object':
+                description_col = col
+                break
+        if description_col is None:
+            description_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
+    
+    # Final validation
     if invoice_col is None or description_col is None:
         missing = []
         if invoice_col is None:
-            missing.append("InvoiceNo/Transaction ID")
+            missing.append("InvoiceNo/Transaction ID/Member Number")
         if description_col is None:
-            missing.append("Description/Product Name")
+            missing.append("Description/Product Name/Item")
         
         error_msg = f"❌ Missing required columns: {', '.join(missing)}\n\n"
-        error_msg += "📋 Your CSV should have:\n"
-        error_msg += "- InvoiceNo (or Transaction ID)\n"
-        error_msg += "- Description (or Product Name)\n"
+        error_msg += f"📋 Detected columns in your file: {list(df.columns)}\n\n"
+        error_msg += "Your CSV should have:\n"
+        error_msg += "- InvoiceNo (or Transaction ID, Order ID, Member Number, etc.)\n"
+        error_msg += "- Description (or Product Name, Item, itemDescription, StockCode, etc.)\n"
         error_msg += "- Quantity (optional)\n"
-        error_msg += "- Country (optional)"
+        error_msg += "- Country (optional)\n\n"
+        error_msg += "💡 Tip: Make sure column names are clear (e.g., 'ProductName', 'itemDescription')"
         
         return False, error_msg, None
+    
+    # Show which columns were mapped
+    st.sidebar.success(f"✅ Mapped Columns:")
+    st.sidebar.write(f"- Invoice: `{invoice_col}`")
+    st.sidebar.write(f"- Description: `{description_col}`")
+    if quantity_col:
+        st.sidebar.write(f"- Quantity: `{quantity_col}`")
+    if country_col:
+        st.sidebar.write(f"- Country: `{country_col}`")
     
     # Rename columns to standard names
     rename_map = {
@@ -122,9 +157,18 @@ def validate_transaction_data(df):
     # Basic data cleaning
     df_cleaned = df_cleaned.dropna(subset=['InvoiceNo', 'Description'])
     
+    # Remove empty strings
+    df_cleaned = df_cleaned[df_cleaned['Description'].astype(str).str.strip() != '']
+    df_cleaned = df_cleaned[df_cleaned['InvoiceNo'].astype(str).str.strip() != '']
+    
+    # Convert InvoiceNo to string
+    df_cleaned['InvoiceNo'] = df_cleaned['InvoiceNo'].astype(str)
+    
     # Check if we have enough data
     if len(df_cleaned) < 10:
-        return False, "❌ Not enough valid transactions (minimum 10 required)", None
+        return False, f"❌ Not enough valid transactions after cleaning (found {len(df_cleaned)}, minimum 10 required)", None
+    
+    st.sidebar.info(f"✅ Loaded {len(df_cleaned)} rows successfully!")
     
     return True, "✅ Data validated successfully!", df_cleaned
 
@@ -170,7 +214,7 @@ with st.sidebar:
         uploaded_file = st.file_uploader(
             "Upload Transaction CSV",
             type=['csv'],
-            help="File should contain: InvoiceNo, Description, Quantity (optional: Country)"
+            help="File should contain: InvoiceNo/Member_number, Description/itemDescription"
         )
         
         if uploaded_file is not None:
@@ -236,9 +280,43 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 df = None
 
 if data_source == "Upload CSV File" and uploaded_file is not None:
-    # Load uploaded file
+    # Load uploaded file with robust parsing
     try:
-        df_uploaded = pd.read_csv(uploaded_file, encoding='latin-1')
+        import io
+        
+        # Read file content
+        content = uploaded_file.read()
+        
+        # Try to decode
+        try:
+            text_content = content.decode('utf-8-sig')  # Handles BOM
+        except:
+            text_content = content.decode('latin-1')
+        
+        # Remove problematic quotes (each line wrapped in quotes)
+        lines = text_content.split('\n')
+        cleaned_lines = []
+        for line in lines:
+            # Remove leading/trailing quotes and whitespace
+            cleaned_line = line.strip().strip('"').strip("'")
+            if cleaned_line:  # Skip empty lines
+                cleaned_lines.append(cleaned_line)
+        
+        # Rejoin lines
+        cleaned_content = '\n'.join(cleaned_lines)
+        
+        # Parse as CSV
+        df_uploaded = pd.read_csv(io.StringIO(cleaned_content))
+        
+        # HANDLE DUPLICATE COLUMNS - CRITICAL FIX
+        if df_uploaded.columns.duplicated().any():
+            st.sidebar.warning("⚠️ Duplicate columns detected. Removing duplicates...")
+            # Keep only first occurrence of each column
+            df_uploaded = df_uploaded.loc[:, ~df_uploaded.columns.duplicated(keep='first')]
+        
+        st.sidebar.success(f"✅ File parsed successfully!")
+        st.sidebar.write(f"Columns found: {list(df_uploaded.columns)}")
+        st.sidebar.write(f"Rows: {len(df_uploaded)}")
         
         # Validate data
         is_valid, message, df_cleaned = validate_transaction_data(df_uploaded)
@@ -251,7 +329,6 @@ if data_source == "Upload CSV File" and uploaded_file is not None:
         else:
             st.error(message)
             st.warning("⚠️ Falling back to sample data")
-            # Load sample data as fallback
             df = load_sample_data()
             st.session_state.data_loaded = True
             st.session_state.data_source = "Sample Data (Fallback)"
@@ -259,6 +336,7 @@ if data_source == "Upload CSV File" and uploaded_file is not None:
     
     except Exception as e:
         st.error(f"❌ Error reading file: {str(e)}")
+        st.sidebar.error(f"Debug info: {type(e).__name__}: {str(e)}")
         st.warning("⚠️ Falling back to sample data")
         df = load_sample_data()
         st.session_state.data_loaded = True
@@ -271,6 +349,10 @@ else:
     st.session_state.data_loaded = True
     st.session_state.data_source = "Sample Data"
     st.session_state.filename = None
+
+# ADDITIONAL FIX: Remove duplicates from df before storing
+if df is not None and df.columns.duplicated().any():
+    df = df.loc[:, ~df.columns.duplicated(keep='first')]
 
 # Store in session
 st.session_state.df = df
@@ -357,8 +439,8 @@ with tab1:
     
     | Column Name | Required | Description | Example |
     |-------------|----------|-------------|---------|
-    | InvoiceNo | ✅ Yes | Transaction/Order ID | INV001, ORDER123 |
-    | Description | ✅ Yes | Product/Item name | Bread, Milk, Coffee |
+    | InvoiceNo / Member_number | ✅ Yes | Transaction/Order/Member ID | INV001, ORDER123, 1808 |
+    | Description / itemDescription | ✅ Yes | Product/Item name | Bread, Milk, tropical fruit |
     | Quantity | ⚠️ Optional | Number purchased | 1, 2, 3 |
     | Country | ⚠️ Optional | Customer location | USA, UK, France |
     
@@ -372,12 +454,20 @@ with tab1:
     INV002,Eggs,3,UK
     ```
     
+    **Or Groceries format:**
+    ```
+    Member_number,Date,itemDescription
+    1808,21-07-2015,tropical fruit
+    1808,21-07-2015,whole milk
+    2552,05-01-2015,yogurt
+    ```
+    
     **Tips:**
     - Use comma-separated values (CSV format)
     - First row should contain column headers
-    - InvoiceNo groups items in the same transaction
+    - InvoiceNo/Member_number groups items in the same transaction
     - Each row represents one item in a transaction
-    - Flexible column names (e.g., "Transaction ID" instead of "InvoiceNo")
+    - Flexible column names (auto-detected)
     """)
     
     # Download sample template
@@ -458,7 +548,7 @@ with tab2:
     else:
         st.info("👆 Click '🚀 Run Analysis' in the sidebar to generate frequent itemsets.")
 
-# TAB 3: Association Rules - FIXED
+# TAB 3: Association Rules - FIXED  
 with tab3:
     # Check if analysis has been run
     if 'analyzer' in st.session_state and 'frequent_itemsets' in st.session_state:
@@ -912,7 +1002,7 @@ with tab5:
     else:
         st.info("👆 Run the analysis first to view visualizations.")
 
-# TAB 6: Export Results
+# TAB 6: Export Results - FIXED
 with tab6:
     if 'rules' in st.session_state and len(st.session_state.rules) > 0:
         st.subheader("📥 Export Results")
@@ -1017,3 +1107,12 @@ Implement personalized recommendations for {len(rules[rules['confidence'] >= 0.5
         
     else:
         st.info("👆 Run the analysis first to export results.")
+
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; color: #5E5240;'>
+    <p>Market Basket Analysis Dashboard | Built with Streamlit | DMBI Project</p>
+    <p>Apriori Algorithm Implementation for Association Rule Mining</p>
+</div>
+""", unsafe_allow_html=True)
